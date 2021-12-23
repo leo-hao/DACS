@@ -67,7 +67,7 @@ def get_arguments():
     return parser.parse_args()
 
 
-
+# 损失计算
 def loss_calc(pred, label):
     label = Variable(label.long()).cuda()
     if len(gpus) > 1:
@@ -77,15 +77,18 @@ def loss_calc(pred, label):
 
     return criterion(pred, label)
 
+# 学习率衰退
 def lr_poly(base_lr, iter, max_iter, power):
     return base_lr * ((1 - float(iter) / max_iter) ** (power))
 
+# 学习率调整
 def adjust_learning_rate(optimizer, i_iter):
     lr = lr_poly(learning_rate, i_iter, num_iterations, lr_power)
     optimizer.param_groups[0]['lr'] = lr
     if len(optimizer.param_groups) > 1 :
         optimizer.param_groups[1]['lr'] = lr * 10
 
+# 创建ema模型
 def create_ema_model(model):
     #ema_model = getattr(models, config['arch']['type'])(self.train_loader.dataset.num_classes, **config['arch']['args']).to(self.device)
     ema_model = Res_Deeplab(num_classes=num_classes)
@@ -108,6 +111,7 @@ def create_ema_model(model):
             ema_model = torch.nn.DataParallel(ema_model, device_ids=gpus)
     return ema_model
 
+# 更新ema模型
 def update_ema_variables(ema_model, model, alpha_teacher, iteration):
     # Use the "true" average until the exponential average is more correct
     alpha_teacher = min(1 - 1 / (iteration + 1), alpha_teacher)
@@ -121,6 +125,7 @@ def update_ema_variables(ema_model, model, alpha_teacher, iteration):
             ema_param.data[:] = alpha_teacher * ema_param[:].data[:] + (1 - alpha_teacher) * param[:].data[:]
     return ema_model
 
+# 强增强
 def strongTransform(parameters, data=None, target=None):
     assert ((data is not None) or (target is not None))
     data, target = transformsgpu.oneMix(mask = parameters["Mix"], data = data, target = target)
@@ -129,16 +134,20 @@ def strongTransform(parameters, data=None, target=None):
     data, target = transformsgpu.flip(flip = parameters["flip"], data = data, target = target)
     return data, target
 
+# 弱增强
 def weakTransform(parameters, data=None, target=None):
     data, target = transformsgpu.flip(flip = parameters["flip"], data = data, target = target)
     return data, target
 
+# 获取弱增强的参数
 def getWeakInverseTransformParameters(parameters):
     return parameters
 
+# 获取强增强的参数
 def getStrongInverseTransformParameters(parameters):
     return parameters
 
+# 归一化
 class DeNormalize(object):
     def __init__(self, mean):
         self.mean = mean
@@ -151,10 +160,12 @@ class DeNormalize(object):
         tensor = torch.flip(tensor,(0,))
         return tensor
 
+# 学习率初始化
 class Learning_Rate_Object(object):
     def __init__(self,learning_rate):
         self.learning_rate = learning_rate
 
+# 保存图像
 def save_image(image, epoch, id, palette):
     with torch.no_grad():
         if image.shape[0] == 3:
@@ -171,6 +182,7 @@ def save_image(image, epoch, id, palette):
             colorized_mask = colorize_mask(mask, palette)
             colorized_mask.save(os.path.join('../visualiseImages', str(epoch)+ id + '.png'))
 
+# 保存断点
 def _save_checkpoint(iteration, model, optimizer, config, ema_model, save_best=False, overwrite=True):
     checkpoint = {
         'iteration': iteration,
@@ -200,6 +212,7 @@ def _save_checkpoint(iteration, model, optimizer, config, ema_model, save_best=F
             except:
                 pass
 
+# 从断点恢复
 def _resume_checkpoint(resume_path, model, optimizer, ema_model):
     print(f'Loading checkpoint : {resume_path}')
     checkpoint = torch.load(resume_path)
@@ -228,6 +241,7 @@ def main():
 
     best_mIoU = 0
 
+    # 一致性loss
     if consistency_loss == 'MSE':
         if len(gpus) > 1:
             unlabeled_loss =  torch.nn.DataParallel(MSELoss2d(), device_ids=gpus).cuda()
@@ -273,10 +287,13 @@ def main():
             model = DataParallelWithCallback(model, device_ids=gpus)
         else:
             model = torch.nn.DataParallel(model, device_ids=gpus)
+    
     model.train()
     model.cuda()
 
+
     cudnn.benchmark = True
+    # 获取数据集
     if dataset == 'cityscapes':
         data_loader = get_loader('cityscapes')
         data_path = get_data_path('cityscapes')
@@ -347,35 +364,51 @@ def main():
             optimizer = optim.Adam(model.optim_parameters(learning_rate_object),
                         lr=learning_rate, weight_decay=weight_decay)
 
+    # 
     optimizer.zero_grad()
 
+    # 上采样
     interp = nn.Upsample(size=(input_size[0], input_size[1]), mode='bilinear', align_corners=True)
+    
+    # 开始迭代数
     start_iteration = 0
 
+    # 
     if args.resume:
         start_iteration, model, optimizer, ema_model = _resume_checkpoint(args.resume, model, optimizer, ema_model)
 
+    # 累计 loss
     accumulated_loss_l = []
     accumulated_loss_u = []
 
+    # 创文件夹 checkpoint
     if not os.path.exists(checkpoint_dir):
         os.makedirs(checkpoint_dir)
     with open(checkpoint_dir + '/config.json', 'w') as handle:
         json.dump(config, handle, indent=4, sort_keys=True)
 
+    # 开始纪元
     epochs_since_start = 0
+
+    # 开始迭代训练
     for i_iter in range(start_iteration, num_iterations):
+
+        # 模型训练
         model.train()
 
+        # loss 这个两个分别是？
         loss_u_value = 0
         loss_l_value = 0
 
+        # 优化器置零
         optimizer.zero_grad()
 
+        # 学习率策略
         if lr_schedule:
             adjust_learning_rate(optimizer, i_iter)
 
         # training loss for labeled data only
+        # 训练源域
         try:
             batch = next(trainloader_iter)
             if batch[0].shape[0] != batch_size:
@@ -391,17 +424,21 @@ def main():
         #else:
         weak_parameters={"flip": 0}
 
-
+        # 图片和标签存入gpu
         images, labels, _, _ = batch
         images = images.cuda()
         labels = labels.cuda().long()
 
         #images, labels = weakTransform(weak_parameters, data = images, target = labels)
 
+        # 模型预测的源域图像结果还上采样
         pred = interp(model(images))
-        L_l = loss_calc(pred, labels) # Cross entropy loss for labeled data
+        # 源域交叉熵损失
+        L_l = loss_calc(pred, labels) # Cross entropy loss for labeled data  交叉熵
         #L_l = torch.Tensor([0.0]).cuda()
 
+
+        # 目标域 无标签的训练
         if train_unlabeled:
             try:
                 batch_remain = next(trainloader_remain_iter)
@@ -411,32 +448,48 @@ def main():
                 trainloader_remain_iter = iter(trainloader_remain)
                 batch_remain = next(trainloader_remain_iter)
 
+            # 目标域图片从batch中获取
             images_remain, _, _, _, _ = batch_remain
             images_remain = images_remain.cuda()
+            # 弱增强
             inputs_u_w, _ = weakTransform(weak_parameters, data = images_remain)
             #inputs_u_w = inputs_u_w.clone()
+            # 目标域图片预测的标签，上采样
             logits_u_w = interp(ema_model(inputs_u_w))
+            # 获取参数、并分离出来不参加更新
             logits_u_w, _ = weakTransform(getWeakInverseTransformParameters(weak_parameters), data = logits_u_w.detach())
 
+            # 通过softmax获取伪标签
             pseudo_label = torch.softmax(logits_u_w.detach(), dim=1)
+            # 获取最大的概率以及伪标签
             max_probs, targets_u_w = torch.max(pseudo_label, dim=1)
 
+            # 混合      
             if mix_mask == "class":
+                # batch=2
                 for image_i in range(batch_size):
+                    # 不重复的类
                     classes = torch.unique(labels[image_i])
                     #classes=classes[classes!=ignore_label]
+                    # 类数
                     nclasses = classes.shape[0]
                     #if nclasses > 0:
+                    # 随机选择一些类
                     classes = (classes[torch.Tensor(np.random.choice(nclasses, int((nclasses+nclasses%2)/2),replace=False)).long()]).cuda()
 
+                    # batch0、1
                     if image_i == 0:
+                        # 用class填充labels
                         MixMask0 = transformmasks.generate_class_mask(labels[image_i], classes).unsqueeze(0).cuda()
                     else:
+                        # batch2
                         MixMask1 = transformmasks.generate_class_mask(labels[image_i], classes).unsqueeze(0).cuda()
 
             elif mix_mask == None:
+                # 没有混合的话，就将mask置1
                 MixMask = torch.ones((inputs_u_w.shape))
 
+            # 强增强参数mix
             strong_parameters = {"Mix": MixMask0}
             if random_flip:
                 strong_parameters["flip"] = random.randint(0, 1)
@@ -451,18 +504,26 @@ def main():
             else:
                 strong_parameters["GaussianBlur"] = 0
 
+            # 将batch0、1里的图片增加一维，源和目标图片cat--> 输入的无标签target
             inputs_u_s0, _ = strongTransform(strong_parameters, data = torch.cat((images[0].unsqueeze(0),images_remain[0].unsqueeze(0))))
+            # s1-->MixMask1
             strong_parameters["Mix"] = MixMask1
             inputs_u_s1, _ = strongTransform(strong_parameters, data = torch.cat((images[1].unsqueeze(0),images_remain[1].unsqueeze(0))))
+            # 输入的 target
             inputs_u_s = torch.cat((inputs_u_s0,inputs_u_s1))
+            # 输出的 混合图片的 预测标签
             logits_u_s = interp(model(inputs_u_s))
 
+            # 
             strong_parameters["Mix"] = MixMask0
+            # 将标签混合
             _, targets_u0 = strongTransform(strong_parameters, target = torch.cat((labels[0].unsqueeze(0),targets_u_w[0].unsqueeze(0))))
             strong_parameters["Mix"] = MixMask1
             _, targets_u1 = strongTransform(strong_parameters, target = torch.cat((labels[1].unsqueeze(0),targets_u_w[1].unsqueeze(0))))
+            # 将label1,2的标签混合
             targets_u = torch.cat((targets_u0,targets_u1)).long()
 
+            # 像素权重的阈值选择
             if pixel_weight == "threshold_uniform":
                 unlabeled_weight = torch.sum(max_probs.ge(0.968).long() == 1).item() / np.size(np.array(targets_u.cpu()))
                 pixelWiseWeight = unlabeled_weight * torch.ones(max_probs.shape).cuda()
@@ -471,6 +532,7 @@ def main():
             elif pixel_weight == False:
                 pixelWiseWeight = torch.ones(max_probs.shape).cuda()
 
+            # 这个onesWeights是什么？？总体的权重？？----真实的标签权重
             onesWeights = torch.ones((pixelWiseWeight.shape)).cuda()
             strong_parameters["Mix"] = MixMask0
             _, pixelWiseWeight0 = strongTransform(strong_parameters, target = torch.cat((onesWeights[0].unsqueeze(0),pixelWiseWeight[0].unsqueeze(0))))
@@ -478,6 +540,8 @@ def main():
             _, pixelWiseWeight1 = strongTransform(strong_parameters, target = torch.cat((onesWeights[1].unsqueeze(0),pixelWiseWeight[1].unsqueeze(0))))
             pixelWiseWeight = torch.cat((pixelWiseWeight0,pixelWiseWeight1)).cuda()
 
+            # 一致性损失函数选择，无标签权重
+            # 目标域损失 默认是ce
             if consistency_loss == 'MSE':
                 unlabeled_weight = torch.sum(max_probs.ge(0.968).long() == 1).item() / np.size(np.array(targets_u.cpu()))
                 #pseudo_label = torch.cat((pseudo_label[1].unsqueeze(0),pseudo_label[0].unsqueeze(0)))
@@ -490,6 +554,7 @@ def main():
         else:
             loss = L_l
 
+        # 统计loss
         if len(gpus) > 1:
             #print('before mean = ',loss)
             loss = loss.mean()
@@ -502,7 +567,9 @@ def main():
             if train_unlabeled:
                 loss_u_value += L_u.item()
 
+        # 反向传播
         loss.backward()
+        # 更新
         optimizer.step()
 
         # update Mean teacher network
@@ -510,14 +577,17 @@ def main():
             alpha_teacher = 0.99
             ema_model = update_ema_variables(ema_model = ema_model, model = model, alpha_teacher=alpha_teacher, iteration=i_iter)
 
+        # 终端打印 loss
         print('iter = {0:6d}/{1:6d}, loss_l = {2:.3f}, loss_u = {3:.3f}'.format(i_iter, num_iterations, loss_l_value, loss_u_value))
 
+        # 保存 checkpoint
         if i_iter % save_checkpoint_every == 0 and i_iter!=0:
             if epochs_since_start * len(trainloader) < save_checkpoint_every:
                 _save_checkpoint(i_iter, model, optimizer, config, ema_model, overwrite=False)
             else:
                 _save_checkpoint(i_iter, model, optimizer, config, ema_model)
 
+        # 如果启用了tensorboard，将loss写入
         if config['utils']['tensorboard']:
             if 'tensorboard_writer' not in locals():
                 tensorboard_writer = tensorboard.SummaryWriter(log_dir, flush_secs=30)
@@ -534,22 +604,25 @@ def main():
                     tensorboard_writer.add_scalar('Training/Unsupervised loss', np.mean(accumulated_loss_u), i_iter)
                     accumulated_loss_u = []
 
-
+        #  mIoU、 eval_loss
         if i_iter % val_per_iter == 0 and i_iter != 0:
+            # 评价
             model.eval()
             if dataset == 'cityscapes':
                 mIoU, eval_loss = evaluate(model, dataset, ignore_label=250, input_size=(512,1024), save_dir=checkpoint_dir)
-
+            # 训练
             model.train()
 
+            # 保存最佳model
             if mIoU > best_mIoU and save_best_model:
                 best_mIoU = mIoU
                 _save_checkpoint(i_iter, model, optimizer, config, ema_model, save_best=True)
 
+            # 保存验证mIoU、Loss
             if config['utils']['tensorboard']:
                 tensorboard_writer.add_scalar('Validation/mIoU', mIoU, i_iter)
                 tensorboard_writer.add_scalar('Validation/Loss', eval_loss, i_iter)
-
+        # 保存图片
         if save_unlabeled_images and train_unlabeled and i_iter % save_checkpoint_every == 0:
             # Saves two mixed images and the corresponding prediction
             save_image(inputs_u_s[0].cpu(),i_iter,'input1',palette.CityScpates_palette)
@@ -560,6 +633,7 @@ def main():
 
     _save_checkpoint(num_iterations, model, optimizer, config, ema_model)
 
+    # 最后验证
     model.eval()
     if dataset == 'cityscapes':
         mIoU, val_loss = evaluate(model, dataset, ignore_label=250, input_size=(512,1024), save_dir=checkpoint_dir)
@@ -590,13 +664,15 @@ if __name__ == '__main__':
     model = config['model']
     dataset = config['dataset']
 
-
+    # 预训练 resnet101 on coco
     if config['pretrained'] == 'coco':
         restore_from = 'http://vllab1.ucmerced.edu/~whung/adv-semi-seg/resnet101COCO-41f33a49.pth'
 
     num_classes=19
+    # 图片均值
     IMG_MEAN = np.array((104.00698793, 116.66876762, 122.67891434), dtype=np.float32)
 
+    # 
     batch_size = config['training']['batch_size']
     num_iterations = config['training']['num_iterations']
 
@@ -644,6 +720,7 @@ if __name__ == '__main__':
     log_per_iter = config['utils']['log_per_iter']
 
     save_best_model = config['utils']['save_best_model']
+
     if args.save_images:
         print('Saving unlabeled images')
         save_unlabeled_images = True
